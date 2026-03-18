@@ -1,0 +1,8 @@
+patch_size_km: 100
+fci_channels: [ir_105, vis_06]
+fci_collection: "EO:EUM:DAT:0662"
+max_time_diff_minutes: 5
+ec_data_dir: "DATA/EC"
+mtg_data_dir: "DATA/MTG"
+patch_output_dir: "DATA/patches"
+chunk_wkt_file: "FCI_chunks.wkt"
