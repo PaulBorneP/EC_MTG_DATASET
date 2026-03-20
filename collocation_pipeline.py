@@ -1,5 +1,8 @@
 """Orchestration script: EarthCARE ↔ MTG FCI collocation pipeline."""
 
+import faulthandler
+faulthandler.enable()
+
 import os
 import csv
 import glob
@@ -48,6 +51,7 @@ def run(config_path="config.yaml"):
     mtg_dir = cfg["mtg_data_dir"]
     patch_dir = cfg["patch_output_dir"]
     wkt_file = cfg["chunk_wkt_file"]
+    dataset_bbox = cfg["dataset_bbox"]
 
     os.makedirs(patch_dir, exist_ok=True)
 
@@ -80,6 +84,12 @@ def run(config_path="config.yaml"):
               f"lon [{lons.min():.1f}, {lons.max():.1f}]")
 
         # Step 2: Filter to MTG disc
+        #filter lats/lons to dataset_bbox first to speed up disc filtering
+        bbox_mask = (
+            (lats >= dataset_bbox[0]) & (lats <= dataset_bbox[1]) &
+            (lons >= dataset_bbox[2]) & (lons <= dataset_bbox[3])
+        )
+        lats, lons, times = lats[bbox_mask], lons[bbox_mask], times[bbox_mask]
         disc_mask = filter_to_mtg_disc(lats, lons)
         lats, lons, times = lats[disc_mask], lons[disc_mask], times[disc_mask]
         if len(lats) == 0:
@@ -180,10 +190,14 @@ def run(config_path="config.yaml"):
                 continue
 
             # Extract patch
-            patch_data = extract_patch(
-                chunk_files, pinfo["lat"], pinfo["lon"],
-                patch_size_km, channels,
-            )
+            try:
+                patch_data = extract_patch(
+                    chunk_files, pinfo["lat"], pinfo["lon"],
+                    patch_size_km, channels,
+                )
+            except Exception as e:
+                print(f"  Patch {pinfo['idx']:03d}: extraction failed, skipping: {e}")
+                continue
 
             # Build output filename
             ec_time_str = pinfo["time"].strftime("%Y%m%dT%H%M%S")

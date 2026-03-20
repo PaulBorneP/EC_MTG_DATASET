@@ -1,8 +1,9 @@
-patch_size_km: 100
-fci_channels: [ir_105, vis_06]
+patch_size_km: 1000
+fci_channels: [ir_105, ir_123, ir_87, ir_38, ir_97, ir_133, wv_63, wv_73, vis_04, vis_05, vis_06, vis_08, vis_09, nir_13, nir_16, nir_22]
 fci_collection: "EO:EUM:DAT:0662"
 max_time_diff_minutes: 5
 ec_data_dir: "DATA/EC"
 mtg_data_dir: "DATA/MTG"
 patch_output_dir: "DATA/patches"
 chunk_wkt_file: "FCI_chunks.wkt"
+dataset_bbox : [-30, 30, -30, 30]  # [min_lat, max_lat, min_lon, max_lon]

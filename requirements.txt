@@ -1,0 +1,11 @@
+h5py
+netCDF4
+numpy
+xarray
+shapely
+pyproj
+eumdac
+pyyaml
+tqdm
+python-dotenv
+earthcarekit

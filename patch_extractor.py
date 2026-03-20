@@ -1,94 +1,23 @@
-"""Local cropping of FCI chunks into square patches."""
+"""Local cropping of FCI chunks into square patches using satpy."""
 
 import os
+import gc
+import logging
 import numpy as np
 import netCDF4 as nc
-from pyproj import Proj
+import dask
+from satpy import Scene
 
+from ec_track import compute_patch_bbox
 
-# FCI geostationary projection parameters
-_FCI_PROJ_PARAMS = dict(
-    proj="geos",
-    h=35786400.0,
-    lon_0=0.0,
-    sweep="y",
-    ellps="WGS84",
-)
-_FCI_PROJ = Proj(**_FCI_PROJ_PARAMS)
-
-# Grid sizes per resolution class
-_IR_GRID = 5568   # ~2 km
-_VIS_GRID = 11136  # ~1 km
-
-# Scale and offset from NetCDF x/y variable attributes (1-based pixel convention)
-# x: scale_factor = -5.589e-5, add_offset = +0.15562  (x_rad = col * x_scale + x_offset)
-# y: scale_factor = +5.589e-5, add_offset = -0.15562  (y_rad = row * y_scale + y_offset)
-_IR_X_SCALE = -5.58871526031607e-05
-_IR_X_OFFSET = 0.15561777642350116
-_IR_Y_SCALE = 5.58871526031607e-05
-_IR_Y_OFFSET = -0.15561777642350116
-
-
-def _is_vis_channel(channel):
-    return channel.startswith("vis_") or channel.startswith("nir_")
-
-
-def _grid_size(channel):
-    return _VIS_GRID if _is_vis_channel(channel) else _IR_GRID
-
-
-def _get_xy_params(channel):
-    """Return (x_scale, x_offset, y_scale, y_offset) for the channel grid."""
-    grid = _grid_size(channel)
-    if grid == _IR_GRID:
-        return _IR_X_SCALE, _IR_X_OFFSET, _IR_Y_SCALE, _IR_Y_OFFSET
-    # VIS/NIR: double the grid, half the pixel angular size
-    return _IR_X_SCALE / 2, _IR_X_OFFSET, _IR_Y_SCALE / 2, _IR_Y_OFFSET
-
-
-def latlon_to_fci_pixel(lon, lat, channel):
-    """Convert geographic coords to FCI global grid pixel indices.
-
-    Returns (row, col) as float indices into the full-disc grid (1-based).
-    """
-    x_scale, x_offset, y_scale, y_offset = _get_xy_params(channel)
-
-    # Geographic -> projection coordinates (metres)
-    x_m, y_m = _FCI_PROJ(lon, lat)
-
-    # Metres -> radians (angular coordinates)
-    x_rad = x_m / _FCI_PROJ_PARAMS["h"]
-    y_rad = y_m / _FCI_PROJ_PARAMS["h"]
-
-    # Invert: x_rad = col * x_scale + x_offset  =>  col = (x_rad - x_offset) / x_scale
-    #         y_rad = row * y_scale + y_offset  =>  row = (y_rad - y_offset) / y_scale
-    col = (x_rad - x_offset) / x_scale
-    row = (y_rad - y_offset) / y_scale
-
-    return row, col
-
-
-def _pixel_range(center_lat, center_lon, size_km, channel):
-    """Compute the pixel row/col range for a square patch."""
-    grid = _grid_size(channel)
-    # Approximate pixel size in km
-    pix_km = 2.0 if grid == _IR_GRID else 1.0
-    half_pix = int(np.ceil(size_km / 2.0 / pix_km))
-
-    center_row, center_col = latlon_to_fci_pixel(center_lon, center_lat, channel)
-    center_row = int(round(center_row))
-    center_col = int(round(center_col))
-
-    row_start = max(center_row - half_pix, 0)
-    row_end = min(center_row + half_pix, grid)
-    col_start = max(center_col - half_pix, 0)
-    col_end = min(center_col + half_pix, grid)
-
-    return row_start, row_end, col_start, col_end
+logger = logging.getLogger(__name__)
 
 
 def extract_patch(chunk_files, center_lat, center_lon, size_km, channels):
     """Extract a square patch from downloaded FCI chunks.
+
+    Uses satpy's fci_l1c_nc reader for projection-correct geolocation,
+    reading scale/offset parameters directly from each chunk file.
 
     Parameters
     ----------
@@ -103,124 +32,71 @@ def extract_patch(chunk_files, center_lat, center_lon, size_km, channels):
         "data" : {channel: 2D numpy array}
         "lat"  : 2D array of latitudes
         "lon"  : 2D array of longitudes
-        "row_range" : (start, end)
-        "col_range" : (start, end)
     """
-    result = {"data": {}}
+    # Geographic bounding box for the patch
+    bbox = compute_patch_bbox(center_lat, center_lon, size_km)
+    # bbox = (min_lon, min_lat, max_lon, max_lat) — matches satpy ll_bbox
 
-    for channel in channels:
-        row_start, row_end, col_start, col_end = _pixel_range(
-            center_lat, center_lon, size_km, channel
-        )
+    # Collect BODY chunk file paths (exclude TRAIL/0041) # why ??
+    filepaths = [fp for cid, fp in chunk_files.items()
+                 if cid != "0041" and os.path.isfile(fp)]
 
-        grid = _grid_size(channel)
-        patch_rows = row_end - row_start
-        patch_cols = col_end - col_start
-        patch = np.full((patch_rows, patch_cols), np.nan, dtype=np.float32)
+    if not filepaths:
+        raise ValueError("No valid chunk files provided")
 
-        for cid, fpath in chunk_files.items():
-            if cid == "0041":  # Skip trailer chunk
-                continue
+    # Verify each chunk file can actually be opened — catches truncated downloads
+    valid_filepaths = []
+    for fp in filepaths:
+        try:
+            with nc.Dataset(fp, "r"):
+                pass
+            valid_filepaths.append(fp)
+        except Exception:
+            logger.warning("Corrupt/truncated chunk, deleting for re-download: %s", fp)
             try:
-                ds = nc.Dataset(fpath)
-            except Exception:
-                continue
+                os.remove(fp)
+            except OSError:
+                pass
+    if not valid_filepaths:
+        raise ValueError("All chunk files are corrupt or missing")
+    filepaths = valid_filepaths
 
-            if channel not in ds["data"].groups:
-                ds.close()
-                continue
+    # netCDF4/HDF5 are not thread-safe; force synchronous execution throughout
+    with dask.config.set(scheduler='synchronous'):
+        scn = Scene(filenames=filepaths, reader='fci_l1c_nc')
 
-            measured = ds["data"][channel]["measured"]
-            chunk_row_start = int(measured.variables["start_position_row"][:])
-            chunk_row_end = int(measured.variables["end_position_row"][:])
-            chunk_col_start = int(measured.variables["start_position_column"][:])
-            chunk_col_end = int(measured.variables["end_position_column"][:])
+        # Load available channels with radiance calibration
+        available = set(scn.available_dataset_names())
+        to_load = [ch for ch in channels if ch in available]
+        if not to_load:
+            raise ValueError(f"None of {channels} found in chunk files")
 
-            # Convert to 0-based
-            chunk_row_start -= 1
-            chunk_row_end -= 1
-            chunk_col_start -= 1
-            chunk_col_end -= 1
+        scn.load(to_load, calibration='radiance')
 
-            # Overlap between patch and chunk
-            ov_row_start = max(row_start, chunk_row_start)
-            ov_row_end = min(row_end, chunk_row_end + 1)
-            ov_col_start = max(col_start, chunk_col_start)
-            ov_col_end = min(col_end, chunk_col_end + 1)
+        # Crop to patch geographic extent
+        cropped = scn.crop(ll_bbox=bbox)
 
-            if ov_row_start >= ov_row_end or ov_col_start >= ov_col_end:
-                ds.close()
-                continue
+        result = {"data": {}}
+        ref_channel = to_load[0]
 
-            # Local indices into the chunk array
-            local_row_start = ov_row_start - chunk_row_start
-            local_row_end = ov_row_end - chunk_row_start
-            local_col_start = ov_col_start - chunk_col_start
-            local_col_end = ov_col_end - chunk_col_start
+        for channel in to_load:
+            ds = cropped[channel]
+            data = np.array(ds.values, dtype=np.float32)
+            result["data"][channel] = data
 
-            # Indices into the patch array
-            patch_row_start = ov_row_start - row_start
-            patch_row_end = ov_row_end - row_start
-            patch_col_start = ov_col_start - col_start
-            patch_col_end = ov_col_end - col_start
+        # Geolocation from reference channel area definition
+        ref_area = cropped[ref_channel].attrs['area']
+        lons, lats = ref_area.get_lonlats()
+        result["lat"] = np.where(np.isfinite(lats), lats, np.nan).astype(np.float32)
+        result["lon"] = np.where(np.isfinite(lons), lons, np.nan).astype(np.float32)
 
-            radiance = measured.variables["effective_radiance"]
-            scale = getattr(radiance, "scale_factor", 1.0)
-            offset = getattr(radiance, "add_offset", 0.0)
+        # Explicitly release Scene (closes HDF5 file handles) before returning
+        del scn, cropped
 
-            raw = radiance[local_row_start:local_row_end, local_col_start:local_col_end]
-            patch[patch_row_start:patch_row_end, patch_col_start:patch_col_end] = (
-                np.array(raw, dtype=np.float32) * scale + offset
-            )
-
-            ds.close()
-
-        result["data"][channel] = patch
-
-    # Store pixel ranges (use first channel for geolocation reference)
-    ref_channel = channels[0]
-    row_start, row_end, col_start, col_end = _pixel_range(
-        center_lat, center_lon, size_km, ref_channel
-    )
-    result["row_range"] = (row_start, row_end)
-    result["col_range"] = (col_start, col_end)
-
-    # Build geolocation arrays from the reference channel grid
-    lat_2d, lon_2d = build_geolocation(row_start, row_end, col_start, col_end, ref_channel)
-    result["lat"] = lat_2d
-    result["lon"] = lon_2d
+    # Force GC to flush HDF5 file handles before the next patch is processed
+    gc.collect()
 
     return result
-
-
-def build_geolocation(row_start, row_end, col_start, col_end, channel):
-    """Inverse geostationary projection: pixel indices -> 2D lat/lon arrays."""
-    x_scale, x_offset, y_scale, y_offset = _get_xy_params(channel)
-
-    rows = np.arange(row_start, row_end)
-    cols = np.arange(col_start, col_end)
-
-    # Pixel -> angular coordinates (radians)
-    # x_rad = col * x_scale + x_offset
-    # y_rad = row * y_scale + y_offset
-    x_rad = cols * x_scale + x_offset
-    y_rad = rows * y_scale + y_offset
-
-    xx, yy = np.meshgrid(x_rad, y_rad)
-
-    # Angular -> metres
-    xx_m = xx * _FCI_PROJ_PARAMS["h"]
-    yy_m = yy * _FCI_PROJ_PARAMS["h"]
-
-    # Inverse projection -> lon, lat
-    lon_2d, lat_2d = _FCI_PROJ(xx_m, yy_m, inverse=True)
-
-    # Mask points outside the disc (pyproj returns 1e30 or inf)
-    invalid = (np.abs(lon_2d) > 180) | (np.abs(lat_2d) > 90)
-    lon_2d[invalid] = np.nan
-    lat_2d[invalid] = np.nan
-
-    return lat_2d.astype(np.float32), lon_2d.astype(np.float32)
 
 
 def save_patch(patch_data, metadata, output_path):

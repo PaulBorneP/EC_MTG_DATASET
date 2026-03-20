@@ -118,15 +118,34 @@ def download_chunks(product, chunk_ids, output_dir):
 
         local_path = os.path.join(output_dir, os.path.basename(entry_str))
         if os.path.exists(local_path):
-            downloaded[cid] = local_path
-            continue
+            # Verify existing cached file is not truncated
+            try:
+                import netCDF4 as _nc4
+                with _nc4.Dataset(local_path, "r"):
+                    pass
+                downloaded[cid] = local_path
+                continue
+            except Exception:
+                print(f"  Cached chunk appears corrupt, re-downloading: {os.path.basename(local_path)}")
+                os.remove(local_path)
 
-        try:
-            with product.open(entry=entry_str) as fsrc:
-                with open(local_path, "wb") as fdst:
-                    shutil.copyfileobj(fsrc, fdst)
-            downloaded[cid] = local_path
-        except Exception as e:
-            print(f"  Warning: failed to download {entry_str}: {e}")
+        for attempt in range(2):
+            try:
+                with product.open(entry=entry_str) as fsrc:
+                    with open(local_path, "wb") as fdst:
+                        shutil.copyfileobj(fsrc, fdst)
+                # Verify the downloaded file is not truncated
+                import netCDF4 as _nc4
+                with _nc4.Dataset(local_path, "r"):
+                    pass
+                downloaded[cid] = local_path
+                break
+            except Exception as e:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                if attempt == 0:
+                    print(f"  Warning: download failed or truncated for {entry_str}, retrying: {e}")
+                else:
+                    print(f"  Warning: download failed after retry for {entry_str}: {e}")
 
     return downloaded
